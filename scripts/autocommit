@@ -21,19 +21,17 @@ OLLAMA_API_URL = "http://localhost:11434/api/generate"
 def run_command(command, allow_error=False):
     """Runs a shell command and returns the output."""
     try:
-        # Added stderr=subprocess.STDOUT to capture the actual error message
         result = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT)
         return result.decode('utf-8').strip()
     except subprocess.CalledProcessError as e:
         if allow_error:
             return e.output.decode('utf-8').strip()
-        # This will now print the ACTUAL git error (e.g., "Please tell me who you are")
         print(f"\n[!] Command failed: {command}")
         print(f"[!] Error message: {e.output.decode('utf-8').strip()}")
         sys.exit(1)
 
 def get_recent_commits(limit=5):
-    """Fetches the last N commit messages to learn your style."""
+    """Fetches the last N commit messages to learn style."""
     try:
         log = run_command(f"git log -n {limit} --pretty=format:'%B%n---COMMIT_DELIMITER---'", allow_error=True)
         if not log: return ""
@@ -42,7 +40,7 @@ def get_recent_commits(limit=5):
         for c in commits:
             clean = c.strip()
             if clean:
-                examples.append(f"Example:\n{clean}")
+                examples.append(f"Recent Example:\n{clean}")
         return "\n\n".join(examples)
     except Exception:
         return ""
@@ -53,10 +51,13 @@ def call_groq_api(prompt):
     data = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "You are a git commit message generator. Output only the raw message without any markdown formatting."},
+            {
+                "role": "system",
+                "content": "You are an expert Git assistant. You generate concise, professional commit messages in Conventional Commits format based on diffs. Output ONLY the raw commit message text."
+            },
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.1
+        "temperature": 0.2
     }
 
     try:
@@ -66,8 +67,7 @@ def call_groq_api(prompt):
             headers={
                 'Content-Type': 'application/json',
                 'Authorization': f'Bearer {GROQ_API_KEY}',
-                # [FIX] Add a Browser User-Agent to bypass Cloudflare 403
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (ArchLinux; KDE Plasma) AI-Autocommit-Script/1.0'
             }
         )
         with urllib.request.urlopen(req) as response:
@@ -75,16 +75,7 @@ def call_groq_api(prompt):
             return result['choices'][0]['message']['content'].strip()
 
     except urllib.error.HTTPError as e:
-        if e.code == 403:
-            print("\n[!] GROQ ERROR 403: Forbidden")
-            print("    This usually means your API Key is invalid or missing permissions.")
-            print("    Check the steps below to fix your Project Settings.")
-        elif e.code == 401:
-            print("[!] Error: Invalid Groq API Key.")
-        elif e.code == 429:
-            print("[!] Error: Groq Rate Limit Exceeded.")
-        else:
-            print(f"[!] Groq API Error: {e}")
+        print(f"[!] Groq API Error: {e.code} - {e.reason}")
         return None
     except Exception as e:
         print(f"[!] Groq Connection Error: {e}")
@@ -94,10 +85,9 @@ def call_ollama_api(prompt):
     """Calls local Ollama API."""
     data = {
         "model": OLLAMA_MODEL,
-        "prompt": prompt,
+        "prompt": f"System: You are a git commit generator. Output ONLY the raw message.\nUser: {prompt}",
         "stream": False,
-        "temperature": 0.1,
-        "keep_alive": "24h"
+        "temperature": 0.2
     }
     try:
         req = urllib.request.Request(
@@ -108,8 +98,8 @@ def call_ollama_api(prompt):
         with urllib.request.urlopen(req) as response:
             result = json.loads(response.read().decode('utf-8'))
             return result.get("response", "").strip()
-    except urllib.error.URLError:
-        print("Error: Ollama is not running. Run 'ollama serve' in background.")
+    except Exception:
+        print("[!] Ollama fallback failed. Is the service running?")
         return None
 
 def clean_message(raw_msg):
@@ -117,46 +107,41 @@ def clean_message(raw_msg):
     if not raw_msg: return ""
     clean = re.sub(r'```\w*\n?', '', raw_msg)
     clean = re.sub(r'```', '', clean)
-    lines = clean.split('\n')
-    final_lines = []
-    started = False
-    for line in lines:
-        if not started:
-            lower = line.lower().strip()
-            if any(x in lower for x in ["here is", "commit message", "sure", "output"]):
-                continue
-            if line.strip() == "":
-                continue
-            started = True
-        final_lines.append(line)
-    return "\n".join(final_lines).strip()
+    # Remove common AI prefix filler
+    clean = re.sub(r'^(Here is|Commit message:|Proposed commit:).*?\n', '', clean, flags=re.IGNORECASE)
+    return clean.strip()
 
 def generate_commit_message(diff_text):
-    if len(diff_text) > 8000:
-        diff_text = diff_text[:8000] + "\n...[Diff truncated]..."
+    if len(diff_text) > 10000:
+        diff_text = diff_text[:10000] + "\n...[Diff truncated]..."
 
-    history = get_recent_commits(5)
+    history = get_recent_commits(3)
 
-    prompt = f"""
-    Instruction: Write a git commit message for the code changes below.
-    STYLE GUIDE (Mimic the format of these examples):
-    {history}
-    Constraint: Do NOT include introductory text.
-    Constraint: Output raw text only.
-    CHANGES:
-    {diff_text}
-    """
+    # REFINED PROMPT
+    prompt = f"""Write a professional git commit message based on the following diff.
 
-    # --- TRY GROQ FIRST ---
-    print(f"Generating with Groq ({GROQ_MODEL})...")
+CONSTRAINTS:
+1. Use the Conventional Commits format: <type>(<scope>): <description>
+   - Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
+2. The first line (subject) must be < 50 characters.
+3. Use the imperative mood ("Add feature" not "Added feature").
+4. If the change is complex, include a body with bullet points after one blank line.
+5. Output ONLY the raw commit message. No explanations or markdown.
+
+{f"REFERENCE HISTORY (Mimic this style if appropriate):" if history else ""}
+{history}
+
+DIFF TO ANALYZE:
+{diff_text}
+"""
+
+    print(f"Generating message with {GROQ_MODEL}...")
     msg = call_groq_api(prompt)
 
-    if msg:
-        return clean_message(msg)
+    if not msg:
+        print("Falling back to local Ollama...")
+        msg = call_ollama_api(prompt)
 
-    # --- FALLBACK TO OLLAMA ---
-    print("Falling back to local Ollama due to API error...")
-    msg = call_ollama_api(prompt)
     return clean_message(msg)
 
 def open_editor(initial_content=""):
@@ -175,48 +160,50 @@ def open_editor(initial_content=""):
 def interactive_review(diff):
     msg = generate_commit_message(diff)
     if not msg:
-        msg = "Auto-commit: Changes made (AI generation failed)"
+        msg = "chore: manual commit (AI generation failed)"
 
     while True:
-        print("\n" + "="*40)
-        print("PROPOSED COMMIT MESSAGE")
-        print("="*40)
+        print("\n" + "═"*40)
+        print(" PROPOSED COMMIT MESSAGE")
+        print("═"*40)
         print(msg)
-        print("="*40 + "\n")
+        print("═"*40 + "\n")
         print("Actions: [a]ccept, [e]dit, [r]egenerate, [m]anual, [c]ancel")
-        choice = input("Select action: ").lower().strip()
+        choice = input("Select action (default 'a'): ").lower().strip()
 
-        if choice == 'a' or choice == '':
+        if choice in ['a', '']:
             return msg
         elif choice == 'e':
             msg = open_editor(msg)
         elif choice == 'r':
-            print("Regenerating...")
             msg = generate_commit_message(diff)
         elif choice == 'm':
             msg = open_editor("")
         elif choice == 'c':
+            print("Commit canceled.")
             sys.exit(0)
 
 def main():
     if not os.path.exists(".git"):
-        print("Initializing new git repository...")
-        run_command("git init")
-        run_command("git checkout -b main", allow_error=True)
+        print("Error: Not a git repository.")
+        sys.exit(1)
 
-    print("Adding files...")
-    run_command("git add .")
-
+    # Check for changes
     status = run_command("git status --porcelain")
     if not status:
         print("No changes to commit.")
         sys.exit(0)
 
+    print("Staging changes...")
+    run_command("git add .")
+
     diff = run_command("git diff --cached", allow_error=True)
-    if not diff: diff = status
+    if not diff:
+        diff = status # Fallback to status if diff is empty
 
     final_msg = interactive_review(diff)
 
+    # Final Commit
     tmp_file = ".git_commit_msg_tmp"
     with open(tmp_file, "w") as f:
         f.write(final_msg)
@@ -224,12 +211,15 @@ def main():
     run_command(f'git commit -F {tmp_file}')
     if os.path.exists(tmp_file): os.remove(tmp_file)
 
-    print("Pushing to origin main (Force)...")
-    try:
-        run_command("git push -f origin main")
-        print("Success! Code pushed.")
-    except Exception:
-        print("Push failed. Remote 'origin' might be missing.")
+    # Push Section
+    push_choice = input("\nPush to origin main? (y/n): ").lower().strip()
+    if push_choice == 'y':
+        try:
+            print("Pushing...")
+            run_command("git push origin main")
+            print("Success!")
+        except Exception as e:
+            print(f"Push failed: {e}")
 
 if __name__ == "__main__":
     main()
